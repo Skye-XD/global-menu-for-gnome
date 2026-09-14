@@ -14,11 +14,11 @@ export default class GlobalMenuExtension extends Extension {
     }
 
     enable() {
-        console.log(`[globalmenu@ShiroOSL.github.io] Enabling extension.`);
+        console.log(`[globalmenu@skye-xd.github.io] Enabling extension.`);
 
         this._settings = this.getSettings();
 
-        const uuid = this.metadata.uuid || 'globalmenu@ShiroOSL.github.io';
+        const uuid = this.metadata.uuid || 'globalmenu@skye-xd.github.io';
 
         this._menuManager = new MenuManager(uuid, this._settings);
 
@@ -85,7 +85,7 @@ export default class GlobalMenuExtension extends Extension {
     }
 
     disable() {
-        console.log(`[globalmenu@ShiroOSL.github.io] Disabling extension.`);
+        console.log(`[globalmenu@skye-xd.github.io] Disabling extension.`);
 
         global.display.disconnectObject(this);
 

@@ -1,6 +1,6 @@
 #!/bin/bash
 
-EXTENSION_UUID="globalmenu@ShiroOSL.github.io"
+EXTENSION_UUID="globalmenu@skye-xd.github.io"
 LOG_FILE="testing.log"
 
 echo "--------------------------------------------------"

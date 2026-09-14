@@ -1,6 +1,6 @@
 #!/bin/bash
 
-EXTENSION_UUID="globalmenu@ShiroOSL.github.io"
+EXTENSION_UUID="globalmenu@skye-xd.github.io"
 EXTENSION_DIR="$HOME/.local/share/gnome-shell/extensions/$EXTENSION_UUID"
 SOURCE_DIR="$(cd "$(dirname "$0")" && pwd)"
 
