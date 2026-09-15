@@ -4,11 +4,13 @@ import Clutter from 'gi://Clutter';
 import GLib from 'gi://GLib';
 import Gio from 'gi://Gio';
 import Shell from 'gi://Shell';
+import Meta from 'gi://Meta';
 import * as PanelMenu from "resource:///org/gnome/shell/ui/panelMenu.js";
 import * as PopupMenu from "resource:///org/gnome/shell/ui/popupMenu.js";
 import * as Main from "resource:///org/gnome/shell/ui/main.js";
 import { ClipboardHistoryStore, ClipboardPanel } from './clipboardHistory.js';
 import { EmojiPicker } from './emojiPicker.js';
+import { AppActionMenu } from './appActionMenu.js';
 
 // Error logging is gated behind the "debug-logging" setting (off by
 // default) so the extension doesn't spam the journal in normal use.
@@ -18,6 +20,45 @@ let debugLoggingEnabled = false;
 function logError(message) {
     if (debugLoggingEnabled) console.error(message);
 }
+
+// Long enough to coalesce the burst of action-added signals an action group
+// emits as it populates, short enough not to lag behind a window switch.
+const REBUILD_DEBOUNCE_MS = 40;
+
+// Polling for an application that has not answered yet is a different job from
+// coalescing the burst of action-added signals it sends once it does, and it
+// wants a much finer interval: measurement showed an app replying in 2ms and
+// the bar still taking 43ms to appear, because the reply then sat in the
+// coalescing timer. Each poll that finds nothing costs two comparisons.
+const POPULATE_POLL_MS = 8;
+
+// How long to keep showing the previous application's menus while the newly
+// focused one's action groups populate. An application that genuinely exports
+// nothing never becomes populated, so this bounds the wait.
+const POPULATE_GRACE_US = 400 * 1000;
+
+// Waiting for a window to take focus is a different wait entirely, and a much
+// longer one: an application being launched routinely takes more than a second
+// to map its first window. Sharing the populate grace meant giving up early and
+// showing the file manager's menus in the gap, which looked like the bar
+// randomly deciding the user had switched to Files.
+const TRANSIENT_FOCUS_GRACE_US = 2000 * 1000;
+
+// Windows that are not applications the user switched to. The desktop is listed
+// separately because focusing it is a deliberate act that should show the file
+// manager, whereas focusing nothing at all is usually just an app starting up.
+const DESKTOP_IDENTIFIERS = ['com.desktop.ding', 'com.desktop.dingextension'];
+
+// Clicking the desktop and an application taking a moment to map its first
+// window are indistinguishable from the shell's side: in both cases nothing is
+// focused. No timeout can separate them -- a short one flashes the file
+// manager's menus during launches, a long one makes a real desktop click take
+// that long to resolve. The desktop-icons fork announces the click on the bus,
+// which is the only signal that tells the two apart, so take it when it is
+// there and fall back to the timeout when it is not.
+const DING_BUS_NAME = 'com.desktop.ding';
+const DING_CLICK_SIGNAL = 'desktopclick';
+const DESKTOP_CLICK_FRESH_US = 1000 * 1000;
 
 // Spawn a command safely using an argv array so no shell parsing/injection
 // can occur, and so arguments with spaces or special characters are passed
@@ -38,8 +79,9 @@ function spawnCommand(argv) {
 
 const TopLevelMenuButton = GObject.registerClass(
   class TopLevelMenuButton extends PanelMenu.Button {
-    _init(label, children, appInstance = null, clipboardPanel = null, emojiPicker = null) {
+    _init(label, children, appInstance = null, clipboardPanel = null, emojiPicker = null, isAppMenu = false) {
       super._init(0.5, label);
+      this._menuLabel = label;
       this._appInstance = appInstance;
       this._clipboardPanel = clipboardPanel;
       this._emojiPicker = emojiPicker;
@@ -50,8 +92,10 @@ const TopLevelMenuButton = GObject.registerClass(
           y_align: Clutter.ActorAlign.CENTER,
           style_class: 'panel-button-label'
       });
+      this._titleLabel = title;
       this.add_child(title);
-      
+
+      this._setAppMenuStyle(isAppMenu);
       this._buildSubMenu(children, this.menu);
 
       if (this.menu) {
@@ -340,7 +384,47 @@ const TopLevelMenuButton = GObject.registerClass(
         }
     }
 
+    // macOS renders the focused application's own name in bold and the menus
+    // after it in regular weight. The shell's own theme already sets
+    // font-weight: bold on every panel button, so marking the application name
+    // bold achieves nothing by itself -- the rest of the bar has to be lightened
+    // for it to stand out. A rule on the label wins over the weight it would
+    // otherwise inherit from the button, whatever the button's own specificity.
+    _setAppMenuStyle(isAppMenu) {
+      if (!this._titleLabel)
+        return;
+      const [add, remove] = isAppMenu
+        ? ['globalmenu-app-name', 'globalmenu-menu-name']
+        : ['globalmenu-menu-name', 'globalmenu-app-name'];
+      this._titleLabel.remove_style_class_name(remove);
+      this._titleLabel.add_style_class_name(add);
+    }
+
+    // Re-point an existing button at a different window rather than destroying
+    // it. Removing and re-adding panel buttons churns the status area, which is
+    // visible as a flicker -- most of all on a mirrored secondary panel, which
+    // re-syncs whenever the status area changes.
+    setContents(label, children, appInstance = null, isAppMenu = false) {
+      this._appInstance = appInstance;
+      if (this._menuLabel !== label) {
+        this._menuLabel = label;
+        if (this._titleLabel)
+          this._titleLabel.text = label;
+        this.set_accessible_name(label);
+      }
+      this._setAppMenuStyle(isAppMenu);
+      this.menu.removeAll();
+      this._buildSubMenu(children, this.menu);
+    }
+
     _buildSubMenu(menuItems, parentMenu) {
+      // Ornament.HIDDEN leaves no room for a checkmark; Ornament.NONE reserves
+      // the column while drawing nothing. Setting it on only the checkable
+      // items therefore indents those and leaves the rest flush, and a menu
+      // that mixes exported actions with window operations gets a ragged left
+      // edge. Reserve the column for every item as soon as one item in the
+      // menu can be checked, which is what both GNOME and macOS do.
+      const reserveOrnament = menuItems.some(i => i.isCheck);
       for (const item of menuItems) {
         if (item.type === "separator") {
           parentMenu.addMenuItem(new PopupMenu.PopupSeparatorMenuItem());
@@ -358,9 +442,20 @@ const TopLevelMenuButton = GObject.registerClass(
           const menuItem = item.icon
             ? new PopupMenu.PopupImageMenuItem(item.label, item.icon)
             : new PopupMenu.PopupMenuItem(item.label);
+          if (reserveOrnament) {
+            // A boolean-stated action is a toggle; showing its state is the
+            // only way the menu reflects what the app is actually doing. Items
+            // that cannot be checked still reserve the column so the labels in
+            // this menu share a left edge.
+            menuItem.setOrnament(item.isCheck && item.checked
+              ? PopupMenu.Ornament.CHECK
+              : PopupMenu.Ornament.NONE);
+          }
           if (item.enabled === false) {
-            // Unimplemented placeholder item.
             menuItem.setSensitive(false);
+          } else if (typeof item.activate === "function") {
+            // A real action read from the application's own action group.
+            menuItem.connectObject("activate", () => item.activate(), menuItem);
           } else if (item.action === "show-clipboard") {
             // connectObject with the item itself as the tracker ties this
             // signal's lifetime to the item, so it's disconnected
@@ -397,7 +492,26 @@ export class MenuManager {
         this.uuid = uuid;
         this._settings = settings;
         this._buttons = [];
-        this._blacklist = ['gjs', 'org.gnome.gjs', 'gnome-shell', 'mutter', 'nautilus', 'org.gnome.nautilus', 'io.github.shiroosl.globalmenu'];
+        this._appMenu = null;
+        this._rebuildTimeoutId = 0;
+        this._context = null;
+        this._fallbackIsTransient = false;
+        this._desktopClickAt = 0;
+
+        // The click is announced a moment after focus has already been handled
+        // as a transient gap, so re-evaluate rather than only recording it.
+        this._dingClickId = Gio.DBus.session.signal_subscribe(
+            DING_BUS_NAME, DING_BUS_NAME, DING_CLICK_SIGNAL, null, null,
+            Gio.DBusSignalFlags.NONE,
+            () => {
+                this._desktopClickAt = GLib.get_monotonic_time();
+                this.updateMenuForWindow(global.display.focus_window);
+            });
+        // wl-clipboard is on this list for the same reason as the rest: it is
+        // not an application anyone switched to. Owning a Wayland selection
+        // requires a live client with a surface, so every text selection maps
+        // a short-lived toplevel that takes focus and then vanishes.
+        this._blacklist = ['gjs', 'org.gnome.gjs', 'gnome-shell', 'mutter', 'io.github.shiroosl.globalmenu', 'com.desktop.ding', 'com.desktop.dingextension', 'io.github.bugaevc.wl-clipboard'];
 
         debugLoggingEnabled = settings.get_boolean('debug-logging');
         this._debugLoggingChangedId = settings.connect('changed::debug-logging', () => {
@@ -413,6 +527,7 @@ export class MenuManager {
     updateMenuForWindow(window) {
         let appName = this._settings.get_string('desktop-app-name') || 'Nautilus';
         let isAppFocused = false;
+        let isDesktop = false;
         let desktopId = "";
         let detectedApp = null;
 
@@ -446,160 +561,315 @@ export class MenuManager {
                     }
                 } else {
                     detectedApp = null;
+                    isDesktop = DESKTOP_IDENTIFIERS.some(id => combinedIdentifiers.includes(id));
                 }
             }
         }
 
-        let desktopAppName = this._settings.get_string('desktop-app-name') || 'Nautilus';
-
-        let firstMenuChildren = [];
-        if (isAppFocused) {
-            if (detectedApp) {
-                let openWindows = detectedApp.get_windows();
-                if (openWindows.length > 0) {
-                    firstMenuChildren.push({ type: "section-header", label: "Open Windows" });
-                    openWindows.forEach(win => {
-                        firstMenuChildren.push({
-                            label: win.get_title() || appName,
-                            action: `activate-window:${win.get_id()}`,
-                            icon: "window-symbolic"
-                        });
-                    });
-                    firstMenuChildren.push({ type: "separator" });
-                }
-            }
-            firstMenuChildren.push(
-                { label: "New Window", action: "new-app-window", icon: "window-new-symbolic" },
-                { type: "separator" },
-                { label: "App Details", action: `app-details:${desktopId}`, icon: "dialog-information-symbolic" },
-                { type: "separator" },
-                { label: `Quit ${appName}`, action: "close", icon: "application-exit-symbolic" }
-            );
+        // Everything below describes what this application can actually do
+        // right now. The window carries the D-Bus coordinates of its own action
+        // groups, so the menus are read from the app rather than assumed.
+        let source = null;
+        if (isAppFocused && window) {
+            this._fallbackIsTransient = false;
+            source = {
+                busName: window.get_gtk_unique_bus_name(),
+                appPath: window.get_gtk_application_object_path(),
+                windowPath: window.get_gtk_window_object_path(),
+                menubarPath: window.get_gtk_menubar_object_path(),
+                appInfo: detectedApp ? detectedApp.get_app_info() : null,
+                appName,
+            };
         } else {
-            firstMenuChildren = [
-                { label: `About ${desktopAppName}`, enabled: false, icon: "dialog-information-symbolic" },
-                { type: "separator" },
-                { label: `Open ${desktopAppName}`, action: "open-file-manager", icon: "folder-symbolic" },
-                { label: "Settings", action: "open-settings", icon: "preferences-system-symbolic" },
-                { type: "separator" },
-                { label: "Empty Bin...", action: "empty-bin", icon: "user-trash-full-symbolic" }
+            // Nothing is focused, which is what clicking the desktop looks like
+            // -- the desktop is a window owned by the desktop-icons extension
+            // rather than an app the user switched to. macOS shows Finder's
+            // menus there, so show the file manager's.
+            source = this._fileManagerSource();
+            if (source) {
+                appName = source.appName;
+                detectedApp = source.app || null;
+            }
+            // Focusing the desktop is deliberate and should switch immediately.
+            // Having no focused window at all usually means an application is
+            // starting, and swapping to the file manager's menus for a moment on
+            // the way is just noise.
+            // A desktopclick that has just arrived means this really is the
+            // desktop, however the window identifiers happened to look.
+            const clickedDesktop = GLib.get_monotonic_time() -
+                (this._desktopClickAt || 0) < DESKTOP_CLICK_FRESH_US;
+            this._fallbackIsTransient = !(isDesktop || clickedDesktop);
+        }
+
+        this._context = { appName, detectedApp, window: isAppFocused ? window : null };
+        this._switchedAt = GLib.get_monotonic_time();
+
+        if (this._appMenu) {
+            this._appMenu.destroy();
+            this._appMenu = null;
+        }
+
+        if (source)
+            this._appMenu = new AppActionMenu(source, () => this._queueRebuild());
+
+        this._rebuild();
+    }
+
+    // Everything here is real: the actions come from the application's own
+    // .desktop file, which is also where their translated names come from, and
+    // quitting goes through the shell rather than a synthesised keystroke.
+    _fallbackAppMenu(app, appName) {
+        if (!app)
+            return null;
+
+        const children = [];
+        const info = app.get_app_info();
+        if (info) {
+            for (const name of info.list_actions()) {
+                const label = info.get_action_name(name);
+                if (!label)
+                    continue;
+                children.push({
+                    label,
+                    enabled: true,
+                    activate: () => app.launch_action(name, global.get_current_time(), -1),
+                });
+            }
+        }
+
+        if (children.length)
+            children.push({ type: 'separator' });
+        children.push({
+            label: `Quit ${appName}`,
+            enabled: true,
+            activate: () => app.request_quit(),
+        });
+
+        return { label: appName, children, isAppMenu: true };
+    }
+
+    // Whichever application handles directories -- Nautilus here, but read from
+    // the user's own default rather than assumed.
+    _fileManagerSource() {
+        let info = null;
+        try {
+            info = Gio.AppInfo.get_default_for_type('inode/directory', false);
+        } catch (e) {
+            logError(`[globalmenu] No handler for inode/directory: ${e}`);
+        }
+        if (!info)
+            return null;
+
+        const app = Shell.AppSystem.get_default().lookup_app(info.get_id());
+        const appName = (app ? app.get_name() : info.get_name()) || 'Files';
+
+        // An open window carries exact coordinates, and brings the
+        // window-scoped actions with it.
+        const windows = app ? app.get_windows() : [];
+        if (windows.length) {
+            const w = windows[0];
+            return {
+                app,
+                appName,
+                busName: w.get_gtk_unique_bus_name(),
+                appPath: w.get_gtk_application_object_path(),
+                windowPath: w.get_gtk_window_object_path(),
+                menubarPath: w.get_gtk_menubar_object_path(),
+                appInfo: app.get_app_info(),
+            };
+        }
+
+        // With no window open there is nothing to read the coordinates from, so
+        // fall back to the GApplication convention: the bus name is the
+        // application id, and the object path is that id with its dots turned
+        // into slashes. Only application-scoped actions exist in this case.
+        const id = info.get_id().replace(/\.desktop$/, '');
+        if (!/^[A-Za-z][A-Za-z0-9_]*(\.[A-Za-z][A-Za-z0-9_-]+)+$/.test(id))
+            return null;
+        return {
+            app,
+            appName,
+            busName: id,
+            appPath: '/' + id.replace(/\./g, '/').replace(/-/g, '_'),
+            windowPath: null,
+            menubarPath: null,
+            appInfo: info,
+        };
+    }
+
+    // Action groups populate asynchronously and then report every enabled-state
+    // change, so an app like Nautilus emits one on each undo or redo. Rebuilding
+    // the panel on each would be both wasteful and visible -- it destroys the
+    // buttons, which closes whatever menu the user currently has open -- so
+    // coalesce them, and never rebuild underneath an open menu.
+    _queueRebuild(delayMs = REBUILD_DEBOUNCE_MS) {
+        if (this._rebuildTimeoutId)
+            return;
+        this._rebuildTimeoutId = GLib.timeout_add(GLib.PRIORITY_DEFAULT, delayMs, () => {
+            this._rebuildTimeoutId = 0;
+            if (this._buttons.some(b => b.menu && b.menu.isOpen)) {
+                this._queueRebuild();
+                return GLib.SOURCE_REMOVE;
+            }
+            this._rebuild();
+            return GLib.SOURCE_REMOVE;
+        });
+    }
+
+    // Real operations every window supports regardless of what it exports over
+    // D-Bus, so the Window menu is never empty and never lies.
+    _windowOperations(window) {
+        if (!window)
+            return [];
+        const items = [
+            { label: 'Minimise', enabled: window.can_minimize(), activate: () => window.minimize() },
+            {
+                label: window.is_maximized() ? 'Unmaximise' : 'Maximise',
+                enabled: window.can_maximize() || window.is_maximized(),
+                activate: () => window.is_maximized()
+                    ? window.unmaximize(Meta.MaximizeFlags.BOTH)
+                    : window.maximize(Meta.MaximizeFlags.BOTH),
+            },
+            {
+                label: window.is_fullscreen() ? 'Leave Full Screen' : 'Enter Full Screen',
+                enabled: true,
+                activate: () => window.is_fullscreen() ? window.unmake_fullscreen() : window.make_fullscreen(),
+            },
+        ];
+        if (window.can_close())
+            items.push({ type: 'separator' }, { label: 'Close Window', enabled: true, activate: () => window.delete(global.get_current_time()) });
+        return items;
+    }
+
+    _rebuild() {
+        const { appName, detectedApp, window } = this._context || {};
+
+        // A D-Bus action group is empty the moment it is created and fills in
+        // asynchronously, so rendering straight away would show an almost empty
+        // bar on every single window switch and then replace it a moment later.
+        // Keep the previous menus up until the new ones have something in them,
+        // which is what a Mac does when you switch applications.
+        if (this._appMenu && !this._appMenu.isPopulated &&
+            GLib.get_monotonic_time() - (this._switchedAt || 0) < POPULATE_GRACE_US) {
+            this._queueRebuild(POPULATE_POLL_MS);
+            return;
+        }
+
+        // Nothing is focused and the desktop was not clicked, so an application
+        // is most likely still starting. Keep the current menus rather than
+        // showing the file manager's for a moment on the way there.
+        if (this._fallbackIsTransient && this._buttons.length &&
+            GLib.get_monotonic_time() - (this._switchedAt || 0) < TRANSIENT_FOCUS_GRACE_US) {
+            this._queueRebuild(POPULATE_POLL_MS);
+            return;
+        }
+
+        let menus = this._appMenu ? this._appMenu.getMenus() : [];
+
+        // Chrome publishes no bus name at all and Firefox publishes one with no
+        // action group behind it, so neither contributes a menu -- and without
+        // one, the bar does not even show the application's name. Their .desktop
+        // files still advertise real, launchable actions, and the shell can
+        // still quit them, so build the application menu out of those.
+        if (!menus.some(m => m.isAppMenu)) {
+            const fallback = this._fallbackAppMenu(detectedApp, appName);
+            if (fallback)
+                menus = [fallback, ...menus];
+        }
+
+        // Which top-level menus the user has switched off. The generated menus
+        // reuse the shipped keys, so these settings keep working untouched.
+        const enabledFor = label => {
+            const key = label === appName ? 'menu-app-enabled' : `menu-${String(label).toLowerCase()}-enabled`;
+            try {
+                return this._settings.get_boolean(key);
+            } catch (e) {
+                // A menu we generated that has no corresponding setting (an app
+                // with an exported menubar of its own naming) is always shown.
+                return true;
+            }
+        };
+
+        let menuData = menus.filter(m => enabledFor(m.label)).map(m => {
+            const children = [...m.children];
+            // The app's own windows are real and worth listing, and only the
+            // shell knows about them -- they are not on the bus.
+            if (m.isAppMenu && detectedApp) {
+                const windows = detectedApp.get_windows();
+                if (windows.length > 1) {
+                    children.push({ type: 'separator' }, { type: 'section-header', label: 'Open Windows' });
+                    windows.forEach(win => children.push({
+                        label: win.get_title() || appName,
+                        enabled: true,
+                        activate: () => win.activate(global.get_current_time()),
+                    }));
+                }
+            }
+            return { type: 'submenu', label: m.label, children, isAppMenu: !!m.isAppMenu };
+        });
+
+        // Window operations attach to an existing Window menu, or become one.
+        const wmItems = this._windowOperations(window);
+        if (wmItems.length && this._settings.get_boolean('menu-window-enabled')) {
+            const existing = menuData.find(m => m.label === 'Window');
+            if (existing)
+                existing.children.push({ type: 'separator' }, ...wmItems);
+            else
+                menuData.push({ type: 'submenu', label: 'Window', children: wmItems });
+        }
+
+        // The clipboard panel and the emoji picker are real, working features of
+        // this extension rather than faked application verbs, and macOS keeps
+        // both at the foot of its Edit menu. Neither depends on the focused app,
+        // so the Edit menu is created for them when the app exports no editing
+        // actions of its own.
+        if (this._settings.get_boolean('menu-edit-enabled')) {
+            const shellItems = [
+                { label: 'Show Clipboard', action: 'show-clipboard', icon: 'edit-paste-symbolic' },
+                { label: 'Emoji & Symbols', action: 'emoji-picker', icon: 'face-smile-symbolic' },
             ];
+            const editMenu = menuData.find(m => m.label === 'Edit');
+            if (editMenu) {
+                editMenu.children.push({ type: 'separator' }, ...shellItems);
+            } else {
+                // Keep Edit in its usual place rather than appending it last.
+                const after = ['View', 'Go', 'Window', 'Help'];
+                const at = menuData.findIndex(m => after.includes(m.label));
+                const entry = { type: 'submenu', label: 'Edit', children: shellItems };
+                if (at === -1)
+                    menuData.push(entry);
+                else
+                    menuData.splice(at, 0, entry);
+            }
         }
-
-        const fileMenu = {
-            type: "submenu",
-            label: "File",
-            icon: "folder-symbolic",
-            children: [
-                { label: `New ${desktopAppName} Window`, action: "new-file-manager-win", icon: "window-new-symbolic" },
-                { label: "New Folder", action: "new-folder", icon: "folder-new-symbolic" },
-                { label: "New Tab", action: "new-tab", icon: "tab-new-symbolic" },
-                { label: "Open", action: "virtual-open", icon: "document-open-symbolic" },
-                { label: "Open With", action: "native-open-with", icon: "document-open-symbolic" },
-                { label: "Print", action: "print", icon: "document-print-symbolic" },
-                { type: "separator" },
-                { label: "Get Info", action: "properties", icon: "dialog-information-symbolic" },
-                { label: "Compress", enabled: false, icon: "package-x-generic-symbolic" },
-                { label: "Duplicate", enabled: false, icon: "edit-copy-symbolic" },
-                { type: "separator" },
-                { label: "Move to Trash", action: "delete-item", icon: "user-trash-symbolic" },
-                { type: "separator" },
-                { label: "Close Window", action: "close", icon: "window-close-symbolic" }
-            ]
-        };
-
-        const editMenu = {
-            type: "submenu",
-            label: "Edit",
-            icon: "document-edit-symbolic",
-            children: [
-                { label: "Undo", action: "undo", icon: "edit-undo-symbolic" },
-                { label: "Redo", action: "redo", icon: "edit-redo-symbolic" },
-                { type: "separator" },
-                { label: "Cut", action: "cut", icon: "edit-cut-symbolic" },
-                { label: "Copy", action: "copy", icon: "edit-copy-symbolic" },
-                { label: "Paste", action: "paste", icon: "edit-paste-symbolic" },
-                { label: "Delete", action: "delete-item", icon: "edit-delete-symbolic" },
-                { label: "Select All", action: "select-all", icon: "edit-select-all-symbolic" },
-                { type: "separator" },
-                { label: "Show Clipboard", action: "show-clipboard", icon: "edit-paste-symbolic" },
-                { type: "separator" },
-                { label: "Emoji & Symbols", action: "emoji-picker", icon: "face-smile-symbolic" }
-            ]
-        };
-
-        const viewMenu = {
-            type: "submenu",
-            label: "View",
-            icon: "view-grid-symbolic",
-            children: [
-                { label: "as Icons", enabled: false, icon: "view-grid-symbolic" },
-                { label: "as List", enabled: false, icon: "view-list-symbolic" },
-                { type: "separator" },
-                { label: "Enter Full Screen", action: "toggle-fullscreen", icon: "view-fullscreen-symbolic" }
-            ]
-        };
-
-        const goMenu = {
-            type: "submenu",
-            label: "Go",
-            icon: "compass-symbolic",
-            children: [
-                { label: "Back", action: "go-back", icon: "go-previous-symbolic" },
-                { label: "Forward", action: "go-forward", icon: "go-next-symbolic" },
-                { type: "separator" },
-                { label: "Recents", action: "go-recents", icon: "document-open-recent-symbolic" },
-                { label: "Documents", action: "go-documents", icon: "folder-documents-symbolic" },
-                { label: "Desktop", action: "go-desktop", icon: "user-desktop-symbolic" },
-                { label: "Downloads", action: "go-downloads", icon: "folder-download-symbolic" },
-                { label: "Home", action: "go-home", icon: "go-home-symbolic" }
-            ]
-        };
-
-        const windowMenu = {
-            type: "submenu",
-            label: "Window",
-            icon: "preferences-system-windows-symbolic",
-            children: [
-                { label: "Minimize", action: "minimize", icon: "window-minimize-symbolic" },
-                { label: "Maximize", action: "maximize", icon: "window-maximize-symbolic" },
-                { type: "separator" },
-                { label: "Close", action: "close", icon: "window-close-symbolic" }
-            ]
-        };
-
-        const helpMenu = {
-            type: "submenu",
-            label: "Help",
-            icon: "help-about-symbolic",
-            children: [
-                { label: "GNOME Help", action: "open-system-help", icon: "help-browser-symbolic" }
-            ]
-        };
-
-        let menuData = [];
-
-        if (this._settings.get_boolean('menu-app-enabled')) {
-            menuData.push({ type: "submenu", label: appName, children: firstMenuChildren });
-        }
-
-        if (this._settings.get_boolean('menu-file-enabled')) menuData.push(fileMenu);
-        if (this._settings.get_boolean('menu-edit-enabled')) menuData.push(editMenu);
-        if (this._settings.get_boolean('menu-view-enabled')) menuData.push(viewMenu);
-        if (this._settings.get_boolean('menu-go-enabled')) menuData.push(goMenu);
-        if (this._settings.get_boolean('menu-window-enabled')) menuData.push(windowMenu);
-        if (this._settings.get_boolean('menu-help-enabled')) menuData.push(helpMenu);
 
         menuData.push(...this._buildCustomMenus());
 
-        this.clear();
-
+        // Panel buttons are kept and refilled rather than rebuilt. Adding or
+        // removing one churns the panel's status area, and the mirrored
+        // secondary panels are driven off that -- a mirrored button clones its
+        // source, so it follows a label or menu change for free, but a source
+        // that is destroyed and replaced has to be torn down and rebuilt, which
+        // is the delay and blink seen on the secondary panels and not on the
+        // primary. Surplus buttons are hidden, never destroyed, so switching
+        // between applications with different numbers of menus costs nothing
+        // more than switching between two windows of one application.
         menuData.forEach((item, index) => {
-            let btn = new TopLevelMenuButton(item.label, item.children, detectedApp, this._clipboardPanel, this._emojiPicker);
+            let btn = this._buttons[index];
+            if (btn) {
+                btn.setContents(item.label, item.children, detectedApp, item.isAppMenu);
+                btn.show();
+                return;
+            }
+            btn = new TopLevelMenuButton(item.label, item.children, detectedApp, this._clipboardPanel, this._emojiPicker, item.isAppMenu);
             Main.panel.addToStatusArea(`${this.uuid}-${index}`, btn, index + 1, 'left');
             this._buttons.push(btn);
         });
+
+        for (let i = menuData.length; i < this._buttons.length; i++)
+            this._buttons[i].hide();
     }
+
 
     _buildCustomMenus() {
         let raw = this._settings.get_string('custom-menus') || '[]';
@@ -637,6 +907,20 @@ export class MenuManager {
     }
 
     destroy() {
+        if (this._dingClickId) {
+            Gio.DBus.session.signal_unsubscribe(this._dingClickId);
+            this._dingClickId = 0;
+        }
+        // The action groups hold signal handlers onto a live D-Bus proxy, and
+        // the rebuild timeout would fire into a destroyed manager.
+        if (this._rebuildTimeoutId) {
+            GLib.source_remove(this._rebuildTimeoutId);
+            this._rebuildTimeoutId = 0;
+        }
+        if (this._appMenu) {
+            this._appMenu.destroy();
+            this._appMenu = null;
+        }
         if (this._settings && this._debugLoggingChangedId) {
             this._settings.disconnect(this._debugLoggingChangedId);
             this._debugLoggingChangedId = null;

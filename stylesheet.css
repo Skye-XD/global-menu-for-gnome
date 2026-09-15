@@ -123,3 +123,16 @@
     min-width: 220px;
     max-width: 280px;
 }
+
+/* macOS renders the focused application's own name in bold and the menus after
+   it in regular weight. The shell's own theme sets font-weight: bold on every
+   panel button, so the application name is only distinguishable once the menus
+   beside it are lightened. Both rules sit on the label itself, which is what
+   lets them win over the weight inherited from the button. */
+.globalmenu-app-name {
+    font-weight: bold;
+}
+
+.globalmenu-menu-name {
+    font-weight: normal;
+}
