@@ -534,7 +534,15 @@ export class MenuManager {
         if (window) {
             let windowType = window.get_window_type();
 
-            if (windowType === 0) {
+            // A DESKTOP-type window is the desktop, whoever drew it, so say so
+            // from the window itself rather than waiting to be told. The
+            // desktopclick signal only fires on a PRIMARY click, so a
+            // right-click on the desktop produced no evidence at all and sat
+            // out the whole transient grace -- the previous application's
+            // menus staying up for two seconds before Files arrived.
+            isDesktop = windowType === Meta.WindowType.DESKTOP;
+
+            if (windowType === Meta.WindowType.NORMAL) {
                 let tracker = Shell.WindowTracker.get_default();
                 detectedApp = tracker.get_window_app(window);
 
