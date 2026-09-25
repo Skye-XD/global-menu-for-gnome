@@ -534,7 +534,15 @@ export class MenuManager {
         if (window) {
             let windowType = window.get_window_type();
 
-            if (windowType === 0) {
+            // A DESKTOP-type window is the desktop, whoever drew it, so say so
+            // from the window itself rather than waiting to be told. The
+            // desktopclick signal only fires on a PRIMARY click, so a
+            // right-click on the desktop produced no evidence at all and sat
+            // out the whole transient grace -- the previous application's
+            // menus staying up for two seconds before Files arrived.
+            isDesktop = windowType === Meta.WindowType.DESKTOP;
+
+            if (windowType === Meta.WindowType.NORMAL) {
                 let tracker = Shell.WindowTracker.get_default();
                 detectedApp = tracker.get_window_app(window);
 
@@ -854,6 +862,12 @@ export class MenuManager {
         // primary. Surplus buttons are hidden, never destroyed, so switching
         // between applications with different numbers of menus costs nothing
         // more than switching between two windows of one application.
+        // Upstream's slot rule: after the Activities button and the logo menu
+        // when those are shown, so Activities can stay on the far left.
+        let hideOverview = this._settings.get_boolean('hide-overview-button');
+        let showLogoMenu = this._settings.get_boolean('show-logo-menu');
+        let baseIndex = (hideOverview ? 0 : 1) + (showLogoMenu ? 1 : 0);
+
         menuData.forEach((item, index) => {
             let btn = this._buttons[index];
             if (btn) {
@@ -862,7 +876,7 @@ export class MenuManager {
                 return;
             }
             btn = new TopLevelMenuButton(item.label, item.children, detectedApp, this._clipboardPanel, this._emojiPicker, item.isAppMenu);
-            Main.panel.addToStatusArea(`${this.uuid}-${index}`, btn, index + 1, 'left');
+            Main.panel.addToStatusArea(`${this.uuid}-${index}`, btn, baseIndex + index, 'left');
             this._buttons.push(btn);
         });
 
