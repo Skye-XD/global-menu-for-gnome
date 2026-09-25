@@ -43,6 +43,11 @@
     </key>
 
     <key name="hide-overview-button" type="b"><default>false</default><summary>Hide the Activities/overview button</summary></key>
+    <key name="keep-activities-left" type="b">
+      <default>true</default>
+      <summary>Keep the Activities button on the far left</summary>
+      <description>When the Activities button is visible, place it on the far left (before the System Menu logo and app menus).</description>
+    </key>
 
     <key name="show-app-grid" type="b"><default>true</default><summary>Show App Grid item in System Menu</summary></key>
     <key name="show-software-center" type="b"><default>true</default><summary>Show Software Center item</summary></key>
@@ -78,6 +83,12 @@
       <default>"[]"</default>
       <summary>JSON clipboard history</summary>
       <description>Each entry: {text, pinned, time}. Capped at 100 items (pinned items exempt from trimming).</description>
+    </key>
+
+    <key name="clipboard-clear-on-startup" type="b">
+      <default>true</default>
+      <summary>Clear unpinned clipboard history on login/reboot</summary>
+      <description>When enabled, non-pinned clipboard history entries are wiped each time the extension starts (e.g. after login or a Shell restart). Pinned entries are kept.</description>
     </key>
 
     <key name="debug-logging" type="b">

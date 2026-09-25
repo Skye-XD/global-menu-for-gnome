@@ -47,10 +47,35 @@ export default class GlobalMenuPreferences extends ExtensionPreferences {
         mainGroup.add(hideOverviewRow);
         settings.bind('hide-overview-button', hideOverviewRow, 'active', Gio.SettingsBindFlags.DEFAULT);
 
+        const keepActivitiesLeftRow = new Adw.SwitchRow({
+            title: 'Keep Activities on Far Left',
+            subtitle: 'Place the native Activities button before the System Menu logo and app menus',
+        });
+        mainGroup.add(keepActivitiesLeftRow);
+        settings.bind('keep-activities-left', keepActivitiesLeftRow, 'active', Gio.SettingsBindFlags.DEFAULT);
+
+        hideOverviewRow.connect('notify::active', () => {
+            keepActivitiesLeftRow.set_sensitive(!hideOverviewRow.get_active());
+        });
+        keepActivitiesLeftRow.set_sensitive(!settings.get_boolean('hide-overview-button'));
+
         const desktopNameRow = new Adw.EntryRow({ title: 'File Manager / Desktop Name' });
         desktopNameRow.set_text(settings.get_string('desktop-app-name'));
         desktopNameRow.connect('notify::text', () => settings.set_string('desktop-app-name', desktopNameRow.get_text() || 'Nautilus'));
         mainGroup.add(desktopNameRow);
+
+        const clipboardGroup = new Adw.PreferencesGroup({
+            title: 'Clipboard History',
+            description: 'Controls for the clipboard history panel',
+        });
+        page.add(clipboardGroup);
+
+        const clearOnStartupRow = new Adw.SwitchRow({
+            title: 'Clear History on Login/Reboot',
+            subtitle: 'Wipe non-pinned clipboard entries each time the Shell restarts (e.g. after login). Pinned entries are kept.',
+        });
+        clipboardGroup.add(clearOnStartupRow);
+        settings.bind('clipboard-clear-on-startup', clearOnStartupRow, 'active', Gio.SettingsBindFlags.DEFAULT);
 
         const logoGroup = new Adw.PreferencesGroup({
             title: 'System Menu',
@@ -58,7 +83,10 @@ export default class GlobalMenuPreferences extends ExtensionPreferences {
         });
         page.add(logoGroup);
 
-        const showLogoRow = new Adw.SwitchRow({ title: 'Show System Menu Button' });
+        const showLogoRow = new Adw.SwitchRow({
+            title: 'Show System Menu Button',
+            subtitle: 'If disabled, app menus start immediately next to Activities',
+        });
         logoGroup.add(showLogoRow);
         settings.bind('show-logo-menu', showLogoRow, 'active', Gio.SettingsBindFlags.DEFAULT);
 
