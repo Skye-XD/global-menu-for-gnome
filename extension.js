@@ -17,6 +17,7 @@ export default class GlobalMenuExtension extends Extension {
         this._settingsChangedId = null;
         this._logoButton = null;
         this._overviewHidden = false;
+        this._activitiesMoved = false;
     }
 
     enable() {
@@ -29,6 +30,10 @@ export default class GlobalMenuExtension extends Extension {
         this._menuManager = new MenuManager(uuid, this._settings);
 
         const ICON_ONLY_KEYS = ['logo-icon-name', 'logo-custom-icon-path', 'logo-distro-icon', 'logo-distro-icon-symbolic', 'logo-icon-size'];
+        // Keys that never change what the bar shows. clipboard-history in
+        // particular is written on every copy, and each sync re-queries the
+        // focused application over D-Bus.
+        const IGNORED_KEYS = ['clipboard-history', 'clipboard-clear-on-startup', 'debug-logging'];
 
         this._settingsChangedId = this._settings.connect('changed', (_settings, key) => {
             if (key === 'hide-overview-button' || key === 'keep-activities-left') {
@@ -37,8 +42,9 @@ export default class GlobalMenuExtension extends Extension {
                 this._syncMenuVisibility();
             } else if (key === 'show-logo-menu') {
                 this._syncLogoButton();
+                this._syncOverviewButton();
                 this._syncMenuVisibility();
-            } else if (!ICON_ONLY_KEYS.includes(key)) {
+            } else if (!ICON_ONLY_KEYS.includes(key) && !IGNORED_KEYS.includes(key)) {
                 // Any other key (menu toggles, custom menus, indicator,
                 // logo-menu item toggles) affects what the bar should show
                 // right now. Icon-only keys are handled internally by
@@ -98,10 +104,19 @@ export default class GlobalMenuExtension extends Extension {
             this._overviewHidden = false;
         }
 
-        if (!shouldHide && activities.container && activities.container.get_parent() === Main.panel._leftBox) {
+        // Order Activities only against our own logo menu. Without the logo
+        // there is nothing to order it against, and forcing index 0 would
+        // displace whatever other extensions put at the far left (a logo
+        // menu of their own, say) -- after which the app menus, placed at
+        // baseIndex, would land ahead of it.
+        if (!shouldHide && this._settings.get_boolean('show-logo-menu') &&
+            activities.container && activities.container.get_parent() === Main.panel._leftBox) {
+            this._activitiesMoved = true;
             let keepLeft = this._settings.get_boolean('keep-activities-left');
-            let targetPos = keepLeft ? 0 : (this._settings.get_boolean('show-logo-menu') ? 1 : 0);
+            let targetPos = keepLeft ? 0 : 1;
             Main.panel._leftBox.set_child_at_index(activities.container, targetPos);
+        } else {
+            this._activitiesMoved = false;
         }
     }
 
@@ -142,9 +157,11 @@ export default class GlobalMenuExtension extends Extension {
                 activities.show();
                 this._overviewHidden = false;
             }
-            if (activities.container && activities.container.get_parent() === Main.panel._leftBox) {
+            if (this._activitiesMoved && activities.container &&
+                activities.container.get_parent() === Main.panel._leftBox) {
                 Main.panel._leftBox.set_child_at_index(activities.container, 0);
             }
+            this._activitiesMoved = false;
         }
 
         this._settings = null;

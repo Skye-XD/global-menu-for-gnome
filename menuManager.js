@@ -494,6 +494,7 @@ export class MenuManager {
         this._buttons = [];
         this._appMenu = null;
         this._rebuildTimeoutId = 0;
+        this._rebuildDueAt = 0;
         this._context = null;
         this._fallbackIsTransient = false;
         this._desktopClickAt = 0;
@@ -710,9 +711,16 @@ export class MenuManager {
     // the panel on each would be both wasteful and visible -- it destroys the
     // buttons, which closes whatever menu the user currently has open -- so
     // coalesce them, and never rebuild underneath an open menu.
+    // A shorter request replaces a pending longer one, so a populate poll is
+    // not held back behind the coalescing debounce.
     _queueRebuild(delayMs = REBUILD_DEBOUNCE_MS) {
-        if (this._rebuildTimeoutId)
-            return;
+        const dueAt = GLib.get_monotonic_time() + delayMs * 1000;
+        if (this._rebuildTimeoutId) {
+            if (dueAt >= this._rebuildDueAt)
+                return;
+            GLib.source_remove(this._rebuildTimeoutId);
+        }
+        this._rebuildDueAt = dueAt;
         this._rebuildTimeoutId = GLib.timeout_add(GLib.PRIORITY_DEFAULT, delayMs, () => {
             this._rebuildTimeoutId = 0;
             if (this._buttons.some(b => b.menu && b.menu.isOpen)) {
@@ -735,8 +743,8 @@ export class MenuManager {
                 label: window.is_maximized() ? 'Unmaximise' : 'Maximise',
                 enabled: window.can_maximize() || window.is_maximized(),
                 activate: () => window.is_maximized()
-                    ? window.unmaximize(Meta.MaximizeFlags.BOTH)
-                    : window.maximize(Meta.MaximizeFlags.BOTH),
+                    ? window.unmaximize()
+                    : window.maximize(),
             },
             {
                 label: window.is_fullscreen() ? 'Leave Full Screen' : 'Enter Full Screen',
@@ -916,6 +924,16 @@ export class MenuManager {
     }
 
     clear() {
+        // The action groups hold signal handlers onto a live D-Bus proxy, and
+        // either they or a pending rebuild timeout would put the buttons back.
+        if (this._rebuildTimeoutId) {
+            GLib.source_remove(this._rebuildTimeoutId);
+            this._rebuildTimeoutId = 0;
+        }
+        if (this._appMenu) {
+            this._appMenu.destroy();
+            this._appMenu = null;
+        }
         this._buttons.forEach(btn => btn.destroy());
         this._buttons = [];
     }
@@ -924,16 +942,6 @@ export class MenuManager {
         if (this._dingClickId) {
             Gio.DBus.session.signal_unsubscribe(this._dingClickId);
             this._dingClickId = 0;
-        }
-        // The action groups hold signal handlers onto a live D-Bus proxy, and
-        // the rebuild timeout would fire into a destroyed manager.
-        if (this._rebuildTimeoutId) {
-            GLib.source_remove(this._rebuildTimeoutId);
-            this._rebuildTimeoutId = 0;
-        }
-        if (this._appMenu) {
-            this._appMenu.destroy();
-            this._appMenu = null;
         }
         if (this._settings && this._debugLoggingChangedId) {
             this._settings.disconnect(this._debugLoggingChangedId);
