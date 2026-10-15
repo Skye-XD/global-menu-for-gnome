@@ -11,6 +11,7 @@ import * as Main from "resource:///org/gnome/shell/ui/main.js";
 import { ClipboardHistoryStore, ClipboardPanel } from './clipboardHistory.js';
 import { EmojiPicker } from './emojiPicker.js';
 import { AppActionMenu } from './appActionMenu.js';
+import { AppMenuRegistrar, DbusMenuSource, xidOf } from './dbusMenu.js';
 
 // Error logging is gated behind the "debug-logging" setting (off by
 // default) so the extension doesn't spam the journal in normal use.
@@ -519,6 +520,15 @@ export class MenuManager {
             debugLoggingEnabled = settings.get_boolean('debug-logging');
         });
 
+        // Apps running under X11 (Electron, Chromium) register their real
+        // menubar here. A registration for the focused window replaces what
+        // was shown for it, so re-evaluate as soon as one arrives.
+        this._registrar = new AppMenuRegistrar(xid => {
+            const focused = global.display.focus_window;
+            if (xid && xidOf(focused) === xid)
+                this.updateMenuForWindow(focused);
+        });
+
         this._clipboardStore = new ClipboardHistoryStore(settings);
         this._clipboardStore.start();
         this._clipboardPanel = new ClipboardPanel(this._clipboardStore);
@@ -618,7 +628,13 @@ export class MenuManager {
             this._appMenu = null;
         }
 
-        if (source)
+        // A menubar the app registered itself is the real thing -- authored,
+        // ordered and labelled by the app -- so it wins over what can be
+        // assembled from action groups.
+        const registered = isAppFocused ? this._registrar.menuFor(xidOf(window)) : null;
+        if (registered)
+            this._appMenu = new DbusMenuSource(registered, () => this._queueRebuild());
+        else if (source)
             this._appMenu = new AppActionMenu(source, () => this._queueRebuild());
 
         this._rebuild();
@@ -939,6 +955,8 @@ export class MenuManager {
     }
 
     destroy() {
+        this._registrar?.destroy();
+        this._registrar = null;
         if (this._dingClickId) {
             Gio.DBus.session.signal_unsubscribe(this._dingClickId);
             this._dingClickId = 0;
