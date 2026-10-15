@@ -132,6 +132,8 @@ export class AppActionMenu {
                 group.connect('action-added', () => this._onChanged()),
                 group.connect('action-removed', () => this._onChanged()),
                 group.connect('action-enabled-changed', () => this._onChanged()),
+                // A toggle's checkmark is read from its state.
+                group.connect('action-state-changed', () => this._onChanged()),
             ];
             this._groups.push({ group, ids });
 
