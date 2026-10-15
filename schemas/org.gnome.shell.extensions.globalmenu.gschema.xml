@@ -91,6 +91,11 @@
       <description>When enabled, non-pinned clipboard history entries are wiped each time the extension starts (e.g. after login or a Shell restart). Pinned entries are kept.</description>
     </key>
 
+    <key name="mac-shortcut-symbols" type="b">
+      <default>false</default>
+      <summary>Show menu shortcuts with macOS symbols</summary>
+      <description>Draw shortcuts as ⌥⇧⌘N instead of Ctrl+Shift+N, with Ctrl shown as ⌘.</description>
+    </key>
     <key name="debug-logging" type="b">
       <default>false</default>
       <summary>Enable verbose error logging to the system journal</summary>
