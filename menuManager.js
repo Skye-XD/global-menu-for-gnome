@@ -12,6 +12,7 @@ import { ClipboardHistoryStore, ClipboardPanel } from './clipboardHistory.js';
 import { EmojiPicker } from './emojiPicker.js';
 import { AppActionMenu } from './appActionMenu.js';
 import { AppMenuRegistrar, DbusMenuSource, xidOf } from './dbusMenu.js';
+import { formatAccel } from './accel.js';
 
 // Error logging is gated behind the "debug-logging" setting (off by
 // default) so the extension doesn't spam the journal in normal use.
@@ -443,6 +444,16 @@ const TopLevelMenuButton = GObject.registerClass(
           const menuItem = item.icon
             ? new PopupMenu.PopupImageMenuItem(item.label, item.icon)
             : new PopupMenu.PopupMenuItem(item.label);
+          if (item.accelLabel) {
+            // Right-aligned and dimmed, like a GTK or macOS menu.
+            menuItem.add_child(new St.Label({
+              text: item.accelLabel,
+              style_class: 'popup-inactive-menu-item globalmenu-accel',
+              x_expand: true,
+              x_align: Clutter.ActorAlign.END,
+              y_align: Clutter.ActorAlign.CENTER,
+            }));
+          }
           if (reserveOrnament) {
             // A boolean-stated action is a toggle; showing its state is the
             // only way the menu reflects what the app is actually doing. Items
@@ -876,6 +887,7 @@ export class MenuManager {
         }
 
         menuData.push(...this._buildCustomMenus());
+        this._labelShortcuts(menuData, this._settings.get_boolean('mac-shortcut-symbols'));
 
         // Panel buttons are kept and refilled rather than rebuilt. Adding or
         // removing one churns the panel's status area, and the mirrored
@@ -909,6 +921,17 @@ export class MenuManager {
     }
 
 
+    // Items carry their shortcut as a GTK accelerator; the label is derived
+    // here so a settings change re-renders every menu the same way.
+    _labelShortcuts(items, mac) {
+        for (const item of items) {
+            if (item.children)
+                this._labelShortcuts(item.children, mac);
+            else if (item.accel)
+                item.accelLabel = formatAccel(item.accel, mac);
+        }
+    }
+
     _buildCustomMenus() {
         let raw = this._settings.get_string('custom-menus') || '[]';
         let sections = [];
@@ -926,6 +949,7 @@ export class MenuManager {
                     .filter(entry => entry && entry.value)
                     .map(entry => ({
                         label: entry.label || '(untitled)',
+                        accel: entry.kind === 'shortcut' ? entry.value : null,
                         action: entry.kind === 'shortcut'
                             ? `custom-shortcut:${entry.value}`
                             : `custom-command:${entry.value}`,

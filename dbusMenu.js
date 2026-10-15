@@ -2,6 +2,8 @@ import Gio from 'gi://Gio';
 import GLib from 'gi://GLib';
 import Meta from 'gi://Meta';
 
+import { fromDbusmenu } from './accel.js';
+
 // Menus exported over com.canonical.dbusmenu, announced through the Unity
 // AppMenu registrar. This is how Electron and Chromium (and Qt) hand their
 // real menubar to a desktop-wide menu -- but only when running under X11:
@@ -257,6 +259,7 @@ export class DbusMenuSource {
                 enabled: props.enabled !== false,
                 isCheck: toggle === 'checkmark' || toggle === 'radio',
                 checked: props['toggle-state'] === 1,
+                accel: fromDbusmenu(props.shortcut),
                 activate: () => this._activate(id),
             });
         }

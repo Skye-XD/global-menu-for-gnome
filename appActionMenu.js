@@ -63,6 +63,39 @@ const KNOWN_LABELS = {
     'zoom-standard': 'Normal Size',
 };
 
+// GNOME's standard accelerators for those same conventional actions (the HIG
+// keyboard shortcuts, and what Files binds them to). GTK keeps an app's own
+// accelerators in-process -- they are not on the bus -- so these stand in.
+const STANDARD_ACCELS = {
+    'clone-window': '<Control>n',
+    'close-current-view': '<Control>w',
+    'copy': '<Control>c',
+    'cut': '<Control>x',
+    'find': '<Control>f',
+    'go-back': '<Alt>Left',
+    'go-forward': '<Alt>Right',
+    'go-home': '<Alt>Home',
+    'go-up': '<Alt>Up',
+    'help': 'F1',
+    'new-tab': '<Control>t',
+    'new-window': '<Control>n',
+    'paste': '<Control>v',
+    'preferences': '<Control>comma',
+    'quit': '<Control>q',
+    'redo': '<Control><Shift>z',
+    'restore-tab': '<Control><Shift>t',
+    'select-all': '<Control>a',
+    'shortcuts': '<Control>question',
+    'show-hidden-files': '<Control>h',
+    'tab-move-left': '<Control><Shift>Page_Up',
+    'tab-move-right': '<Control><Shift>Page_Down',
+    'toggle-sidebar': 'F9',
+    'undo': '<Control>z',
+    'zoom-in': '<Control>plus',
+    'zoom-out': '<Control>minus',
+    'zoom-standard': '<Control>0',
+};
+
 // Which menu each action appears under, and in what order. An explicit order
 // reads far better than sorting alphabetically, and keeps a menu's contents
 // stable as actions come and go. Actions not named here are not dropped -- they
@@ -266,6 +299,7 @@ export class AppActionMenu {
         return {
             label: this._labelFor(action.name),
             enabled: action.enabled,
+            accel: STANDARD_ACCELS[action.name] ?? null,
             isCheck,
             checked: isCheck ? action.state.get_boolean() : false,
             activate: action.activate,
@@ -317,11 +351,13 @@ export class AppActionMenu {
             if (!label)
                 continue;
 
+            const accel = model.get_item_attribute_value(i, 'accel', null);
             const actionName = target ? target.get_string()[0].replace(/^(app|win)\./, '') : null;
             const action = actionName ? this._collectActions().get(actionName) : null;
             items.push({
                 label: label.get_string()[0].replace(/_/g, ''),
                 enabled: action ? action.enabled : !!action,
+                accel: accel ? accel.get_string()[0] : null,
                 activate: action ? action.activate : () => {},
             });
         }
