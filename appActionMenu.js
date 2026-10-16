@@ -122,9 +122,21 @@ function humanize(name) {
 
 // An exported menubar is the app's data. A menu can link back to itself or
 // branch exponentially, and walking it naively would hang the compositor;
-// anything deeper or larger than this is dropped.
+// anything deeper or larger than this is dropped. The item budget is per
+// top-level menu, so one huge menu cannot starve the ones after it, under a
+// total for the whole bar.
 const MENU_MAX_DEPTH = 8;
-const MENU_MAX_ITEMS = 1000;
+const MENU_MAX_ITEMS = 500;
+const MENU_MAX_TOTAL_ITEMS = 3000;
+const MENU_MAX_TOP_LEVEL = 32;
+
+function spendItem(walk) {
+    if (walk.count >= MENU_MAX_ITEMS || walk.total >= MENU_MAX_TOTAL_ITEMS)
+        return false;
+    walk.count++;
+    walk.total++;
+    return true;
+}
 
 // So is every attribute. Asking for the expected type makes a mismatched one
 // come back as null instead of throwing from get_string().
@@ -325,11 +337,13 @@ export class AppActionMenu {
         // The visited set only catches a model object seen twice; a D-Bus menu
         // proxy hands out a fresh object per link, so the depth and item caps
         // are what guarantee the walk ends.
-        const walk = { visited: new Set([this._menuModel]), count: 0, actions: this._collectActions() };
+        const walk = { visited: new Set([this._menuModel]), count: 0, total: 0, actions: this._collectActions() };
         const menus = [];
-        const n = this._menuModel.get_n_items();
-        for (let i = 0; i < n && walk.count < MENU_MAX_ITEMS; i++) {
-            walk.count++;
+        const n = Math.min(this._menuModel.get_n_items(), MENU_MAX_TOP_LEVEL);
+        for (let i = 0; i < n; i++) {
+            walk.count = 0;
+            if (!spendItem(walk))
+                break;
             const submenu = this._menuModel.get_item_link(i, 'submenu');
             if (!submenu || walk.visited.has(submenu))
                 continue;
@@ -349,8 +363,9 @@ export class AppActionMenu {
         if (depth > MENU_MAX_DEPTH)
             return items;
         const n = model.get_n_items();
-        for (let i = 0; i < n && walk.count < MENU_MAX_ITEMS; i++) {
-            walk.count++;
+        for (let i = 0; i < n; i++) {
+            if (!spendItem(walk))
+                break;
             const label = stringAttr(model, i, 'label');
             const target = stringAttr(model, i, 'action');
             const section = model.get_item_link(i, 'section');

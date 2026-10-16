@@ -54,15 +54,29 @@ const REFETCH_DEBOUNCE_MS = 100;
 // without limit.
 const MAX_WINDOWS_PER_SENDER = 64;
 
-// An app registers when it maps its window, and the D-Bus call can arrive
-// before mutter has managed the window it names -- they reach the compositor
-// over different sockets. Wait this long for it to appear before refusing.
+// An app may register a window before mutter manages it: Qt does so before
+// it even maps the window, blocking its own thread on the reply, and the
+// D-Bus call and the X11 map reach the compositor over different sockets
+// anyway. So an unknown xid is accepted at once and dropped if no such
+// window turns up within this long.
 const REGISTER_WAIT_MS = 2000;
 
 // The layout is the app's data, and walking it builds one actor per item;
-// anything deeper or larger than this is dropped rather than rendered.
+// anything deeper or larger than this is dropped rather than rendered. The
+// item budget is per top-level menu, so one huge menu cannot starve the ones
+// after it (Window, Help), under a total for the whole bar.
 const MAX_DEPTH = 8;
-const MAX_ITEMS = 1000;
+const MAX_ITEMS = 500;
+const MAX_TOTAL_ITEMS = 3000;
+const MAX_TOP_LEVEL = 32;
+
+function spend(walk) {
+    if (walk.count >= MAX_ITEMS || walk.total >= MAX_TOTAL_ITEMS)
+        return false;
+    walk.count++;
+    walk.total++;
+    return true;
+}
 
 // The X window id of an X11 window, or 0. Mutter does not introspect
 // meta_window_x11_get_xwindow(), but describes every X11 window as
@@ -86,14 +100,10 @@ export class AppMenuRegistrar {
         this._onChanged = onChanged || (() => {});
         this._menus = new Map();      // xid -> {busName, path}
         this._watches = new Map();    // busName -> watch id
-        this._pending = new Set();    // {xid, busName, path, invocation, timeoutId}
+        this._provisional = new Map(); // xid -> timeout id, see _expectWindow
 
         global.display.connectObject('window-created', (_display, window) => {
-            const xid = xidOf(window);
-            for (const p of this._pending) {
-                if (p.xid === xid)
-                    this._settle(p, true);
-            }
+            this._forgetProvisional(xidOf(window));
         }, this);
 
         this._exported = Gio.DBusExportedObject.wrapJSObject(REGISTRAR_XML, this);
@@ -141,58 +151,60 @@ export class AppMenuRegistrar {
                 `${busName} has registered ${MAX_WINDOWS_PER_SENDER} windows`);
             return;
         }
-        if (!isManagedXid(xid)) {
-            const p = {xid, busName, path, invocation};
-            p.timeoutId = GLib.timeout_add(GLib.PRIORITY_DEFAULT, REGISTER_WAIT_MS, () => {
-                p.timeoutId = 0;
-                // Checked again rather than assumed: the window may have been
-                // managed without its xid being readable at window-created.
-                this._settle(p, isManagedXid(p.xid));
-                return GLib.SOURCE_REMOVE;
-            });
-            this._pending.add(p);
-            return;
-        }
+        const known = isManagedXid(xid);
         this._register(xid, busName, path, invocation);
+        if (!known)
+            this._expectWindow(xid);
     }
 
-    // Windows held by a sender, pending ones included. A client that never
-    // unregisters a closed window would reach the cap over a long session, so
-    // at the cap its entries for windows that no longer exist are dropped.
+    // A claim on an xid no window has yet lasts REGISTER_WAIT_MS, so nobody
+    // can stake one out long ahead of the window that will get it.
+    _expectWindow(xid) {
+        this._forgetProvisional(xid);
+        this._provisional.set(xid, GLib.timeout_add(GLib.PRIORITY_DEFAULT, REGISTER_WAIT_MS, () => {
+            this._provisional.delete(xid);
+            // Checked again rather than assumed: the window may have been
+            // managed without its xid being readable at window-created.
+            if (!isManagedXid(xid))
+                this._drop(xid);
+            return GLib.SOURCE_REMOVE;
+        }));
+    }
+
+    _forgetProvisional(xid) {
+        const id = this._provisional.get(xid);
+        if (id) {
+            GLib.source_remove(id);
+            this._provisional.delete(xid);
+        }
+    }
+
+    _drop(xid) {
+        const entry = this._menus.get(xid);
+        if (!entry)
+            return;
+        this._forgetProvisional(xid);
+        this._menus.delete(xid);
+        this._unwatchSenderIfUnused(entry.busName);
+        this._exported.emit_signal('WindowUnregistered', new GLib.Variant('(u)', [xid]));
+        this._onChanged(xid);
+    }
+
+    // Windows held by a sender. A client that never unregisters a closed
+    // window would reach the cap over a long session, so at the cap its
+    // entries for windows that no longer exist are dropped -- not ones still
+    // waiting for their window.
     _countFor(busName) {
-        const count = () => [...this._menus.values(), ...this._pending]
+        const count = () => [...this._menus.values()]
             .filter(e => e.busName === busName).length;
         const n = count();
         if (n < MAX_WINDOWS_PER_SENDER)
             return n;
-        for (const [xid, entry] of this._menus) {
-            if (entry.busName === busName && !isManagedXid(xid)) {
-                this._menus.delete(xid);
-                this._exported.emit_signal('WindowUnregistered', new GLib.Variant('(u)', [xid]));
-            }
+        for (const [xid, entry] of [...this._menus]) {
+            if (entry.busName === busName && !this._provisional.has(xid) && !isManagedXid(xid))
+                this._drop(xid);
         }
         return count();
-    }
-
-    _settle(p, managed) {
-        this._pending.delete(p);
-        if (p.timeoutId) {
-            GLib.source_remove(p.timeoutId);
-            p.timeoutId = 0;
-        }
-        if (!managed) {
-            p.invocation.return_dbus_error('org.freedesktop.DBus.Error.InvalidArgs',
-                `no window ${p.xid}`);
-            return;
-        }
-        // Someone else may have claimed it while this one waited.
-        const previous = this._menus.get(p.xid);
-        if (previous && previous.busName !== p.busName) {
-            p.invocation.return_dbus_error('org.freedesktop.DBus.Error.AccessDenied',
-                `window ${p.xid} already has a menu from ${previous.busName}`);
-            return;
-        }
-        this._register(p.xid, p.busName, p.path, p.invocation);
     }
 
     _register(xid, busName, path, invocation) {
@@ -213,6 +225,7 @@ export class AppMenuRegistrar {
         }
         invocation.return_value(null);
         if (entry) {
+            this._forgetProvisional(xid);
             this._menus.delete(xid);
             this._unwatchSenderIfUnused(entry.busName);
             this._exported.emit_signal('WindowUnregistered', new GLib.Variant('(u)', [xid]));
@@ -240,6 +253,7 @@ export class AppMenuRegistrar {
                 this._watches.delete(busName);
                 for (const [xid, entry] of this._menus) {
                     if (entry.busName === busName) {
+                        this._forgetProvisional(xid);
                         this._menus.delete(xid);
                         this._onChanged(xid);
                     }
@@ -263,13 +277,9 @@ export class AppMenuRegistrar {
 
     destroy() {
         global.display.disconnectObject(this);
-        for (const p of this._pending) {
-            if (p.timeoutId)
-                GLib.source_remove(p.timeoutId);
-            p.invocation.return_dbus_error('org.freedesktop.DBus.Error.Failed',
-                'registrar is shutting down');
-        }
-        this._pending.clear();
+        for (const id of this._provisional.values())
+            GLib.source_remove(id);
+        this._provisional.clear();
         for (const id of this._watches.values())
             Gio.bus_unwatch_name(id);
         this._watches.clear();
@@ -344,8 +354,10 @@ export class DbusMenuSource {
 
     async _fetch(first = false) {
         try {
+            // Depth-limited: the whole reply is unpacked before any cap below
+            // applies, so do not ask for more than will ever be walked.
             let reply = await this._call('GetLayout',
-                new GLib.Variant('(iias)', [0, -1, []]), '(u(ia{sv}av))');
+                new GLib.Variant('(iias)', [0, MAX_DEPTH, []]), '(u(ia{sv}av))');
             let [, layout] = reply.recursiveUnpack();
 
             // A menubar opens its menus before showing them, and an app may only
@@ -357,7 +369,7 @@ export class DbusMenuSource {
             // whole extension was disabled.
             if (first) {
                 let stale = false;
-                for (const node of layout[2]) {
+                for (const node of layout[2].slice(0, MAX_TOP_LEVEL)) {
                     if (!isNode(node))
                         continue;
                     try {
@@ -374,7 +386,7 @@ export class DbusMenuSource {
                 }
                 if (stale) {
                     reply = await this._call('GetLayout',
-                        new GLib.Variant('(iias)', [0, -1, []]), '(u(ia{sv}av))');
+                        new GLib.Variant('(iias)', [0, MAX_DEPTH, []]), '(u(ia{sv}av))');
                     [, layout] = reply.recursiveUnpack();
                 }
             }
@@ -405,16 +417,15 @@ export class DbusMenuSource {
             .catch(e => console.warn(`[globalmenu] dbusmenu Event: ${e.message}`));
     }
 
-    // `walk` counts items across the whole tree, so a wide menu is bounded as
-    // well as a deep one.
+    // `walk` counts items within this top-level menu and across the bar
+    // (spend), so a wide menu is bounded as well as a deep one.
     _items(children, walk, depth) {
         const items = [];
         if (depth > MAX_DEPTH)
             return items;
         for (const node of children) {
-            if (!isNode(node) || walk.count >= MAX_ITEMS)
+            if (!isNode(node) || !spend(walk))
                 continue;
-            walk.count++;
             const [id, props, grandchildren] = node;
             if (props.visible === false)
                 continue;
@@ -452,11 +463,11 @@ export class DbusMenuSource {
         if (!this._layout)
             return [];
         const menus = [];
-        const walk = {count: 0};
-        for (const node of this._layout[2]) {
-            if (!isNode(node) || walk.count >= MAX_ITEMS)
+        const walk = {count: 0, total: 0};
+        for (const node of this._layout[2].slice(0, MAX_TOP_LEVEL)) {
+            walk.count = 0;
+            if (!isNode(node) || !spend(walk))
                 continue;
-            walk.count++;
             const [, props, children] = node;
             if (props.visible === false)
                 continue;
