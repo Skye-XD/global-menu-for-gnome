@@ -12,6 +12,10 @@
     "50"
   ],
   "url": "https://github.com/ShiroOSL/global-menu-for-gnome",
+  "session-modes": [
+    "user",
+    "unlock-dialog"
+  ],
   "settings-schema": "org.gnome.shell.extensions.globalmenu",
   "donations": {
     "kofi": "shiro_osl"

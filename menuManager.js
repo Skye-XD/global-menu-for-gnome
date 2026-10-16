@@ -517,6 +517,7 @@ export class MenuManager {
         this._context = null;
         this._fallbackIsTransient = false;
         this._desktopClickAt = 0;
+        this._locked = false;
         this._destroyed = false;
 
         // The click is announced a moment after focus has already been handled
@@ -554,8 +555,21 @@ export class MenuManager {
         this._emojiPicker = new EmojiPicker();
     }
 
+    // While the screen is locked the bar must show nothing and follow nothing:
+    // it is emptied, the floating panels are closed, and every path back in is
+    // ignored until unlock. The registrar keeps running, so the windows X11
+    // apps registered are still known afterwards.
+    setLocked(locked) {
+        this._locked = locked;
+        if (!locked)
+            return;
+        this._clipboardPanel?.close();
+        this._emojiPicker?.close();
+        this.clear();
+    }
+
     updateMenuForWindow(window) {
-        if (this._destroyed)
+        if (this._locked || this._destroyed)
             return;
         let appName = this._settings.get_string('desktop-app-name') || 'Nautilus';
         let isAppFocused = false;
@@ -760,7 +774,7 @@ export class MenuManager {
     // A shorter request replaces a pending longer one, so a populate poll is
     // not held back behind the coalescing debounce.
     _queueRebuild(delayMs = REBUILD_DEBOUNCE_MS) {
-        if (this._destroyed)
+        if (this._locked || this._destroyed)
             return;
         const dueAt = GLib.get_monotonic_time() + delayMs * 1000;
         if (this._rebuildTimeoutId) {
@@ -810,7 +824,7 @@ export class MenuManager {
     }
 
     _rebuild() {
-        if (this._destroyed)
+        if (this._locked || this._destroyed)
             return;
         const { appName, detectedApp, window } = this._context || {};
 
