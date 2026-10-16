@@ -120,6 +120,19 @@ function humanize(name) {
         .replace(/\b\w/g, c => c.toUpperCase());
 }
 
+// An exported menubar is the app's data. A menu can link back to itself or
+// branch exponentially, and walking it naively would hang the compositor;
+// anything deeper or larger than this is dropped.
+const MENU_MAX_DEPTH = 8;
+const MENU_MAX_ITEMS = 1000;
+
+// So is every attribute. Asking for the expected type makes a mismatched one
+// come back as null instead of throwing from get_string().
+function stringAttr(model, i, name) {
+    const value = model.get_item_attribute_value(i, name, new GLib.VariantType('s'));
+    return value ? value.get_string()[0] : null;
+}
+
 export class AppActionMenu {
     // `appInfo` is the Gio.DesktopAppInfo behind the focused window, used only
     // for its translated action names. `onChanged` is called whenever the menu
@@ -309,55 +322,70 @@ export class AppActionMenu {
     // Render a genuine exported menubar. Nothing on this desktop exports one
     // today, so this path is correct-by-construction rather than battle-tested.
     _fromMenuModel() {
+        // The visited set only catches a model object seen twice; a D-Bus menu
+        // proxy hands out a fresh object per link, so the depth and item caps
+        // are what guarantee the walk ends.
+        const walk = { visited: new Set([this._menuModel]), count: 0, actions: this._collectActions() };
         const menus = [];
         const n = this._menuModel.get_n_items();
-        for (let i = 0; i < n; i++) {
-            const label = this._menuModel.get_item_attribute_value(i, 'label', null);
+        for (let i = 0; i < n && walk.count < MENU_MAX_ITEMS; i++) {
+            walk.count++;
             const submenu = this._menuModel.get_item_link(i, 'submenu');
-            if (!submenu)
+            if (!submenu || walk.visited.has(submenu))
                 continue;
+            walk.visited.add(submenu);
+            const label = stringAttr(this._menuModel, i, 'label');
             menus.push({
-                label: label ? label.get_string()[0].replace(/_/g, '') : '',
-                children: this._itemsFrom(submenu),
+                label: label ? label.replace(/_/g, '') : '',
+                children: this._itemsFrom(submenu, walk, 1),
                 isAppMenu: i === 0,
             });
         }
         return menus;
     }
 
-    _itemsFrom(model) {
+    _itemsFrom(model, walk, depth) {
         const items = [];
+        if (depth > MENU_MAX_DEPTH)
+            return items;
         const n = model.get_n_items();
-        for (let i = 0; i < n; i++) {
-            const label = model.get_item_attribute_value(i, 'label', null);
-            const target = model.get_item_attribute_value(i, 'action', null);
+        for (let i = 0; i < n && walk.count < MENU_MAX_ITEMS; i++) {
+            walk.count++;
+            const label = stringAttr(model, i, 'label');
+            const target = stringAttr(model, i, 'action');
             const section = model.get_item_link(i, 'section');
             const submenu = model.get_item_link(i, 'submenu');
 
             if (section) {
+                if (walk.visited.has(section))
+                    continue;
+                walk.visited.add(section);
                 if (items.length)
                     items.push({ type: 'separator' });
-                items.push(...this._itemsFrom(section));
+                items.push(...this._itemsFrom(section, walk, depth + 1));
                 continue;
             }
             if (submenu) {
+                if (walk.visited.has(submenu))
+                    continue;
+                walk.visited.add(submenu);
                 items.push({
                     type: 'submenu',
-                    label: label ? label.get_string()[0].replace(/_/g, '') : '',
-                    children: this._itemsFrom(submenu),
+                    label: label ? label.replace(/_/g, '') : '',
+                    children: this._itemsFrom(submenu, walk, depth + 1),
                 });
                 continue;
             }
             if (!label)
                 continue;
 
-            const accel = model.get_item_attribute_value(i, 'accel', null);
-            const actionName = target ? target.get_string()[0].replace(/^(app|win)\./, '') : null;
-            const action = actionName ? this._collectActions().get(actionName) : null;
+            const accel = stringAttr(model, i, 'accel');
+            const actionName = target ? target.replace(/^(app|win)\./, '') : null;
+            const action = actionName ? walk.actions.get(actionName) : null;
             items.push({
-                label: label.get_string()[0].replace(/_/g, ''),
+                label: label.replace(/_/g, ''),
                 enabled: action ? action.enabled : !!action,
-                accel: accel ? accel.get_string()[0] : null,
+                accel,
                 activate: action ? action.activate : () => {},
             });
         }
