@@ -79,8 +79,21 @@ export class AppMenuRegistrar {
 
     // D-Bus methods. The Async forms receive the invocation, which is the only
     // way to learn who is registering: the menu lives on the caller's bus name.
+    //
+    // First come owns a window: while the app that registered a window's menu
+    // is still on the bus, nobody else can replace or remove it, so no other
+    // process can put its own menu on an app's window. (Matching the sender's
+    // pid against the window's would be stricter, but a flatpak reaches the
+    // bus through xdg-dbus-proxy, whose pid is not the app's.) The claim ends
+    // when the owner unregisters or leaves the bus (_watchSender).
     RegisterWindowAsync([xid, path], invocation) {
         const busName = invocation.get_sender();
+        const previous = this._menus.get(xid);
+        if (previous && previous.busName !== busName) {
+            invocation.return_dbus_error('org.freedesktop.DBus.Error.AccessDenied',
+                `window ${xid} already has a menu from ${previous.busName}`);
+            return;
+        }
         this._menus.set(xid, {busName, path});
         this._watchSender(busName);
         invocation.return_value(null);
@@ -89,8 +102,17 @@ export class AppMenuRegistrar {
         this._onChanged(xid);
     }
 
-    UnregisterWindow(xid) {
-        if (this._menus.delete(xid)) {
+    UnregisterWindowAsync([xid], invocation) {
+        const entry = this._menus.get(xid);
+        if (entry && entry.busName !== invocation.get_sender()) {
+            invocation.return_dbus_error('org.freedesktop.DBus.Error.AccessDenied',
+                `window ${xid} has a menu from ${entry.busName}`);
+            return;
+        }
+        invocation.return_value(null);
+        if (entry) {
+            this._menus.delete(xid);
+            this._unwatchSenderIfUnused(entry.busName);
             this._exported.emit_signal('WindowUnregistered', new GLib.Variant('(u)', [xid]));
             this._onChanged(xid);
         }
@@ -122,6 +144,19 @@ export class AppMenuRegistrar {
                 }
             });
         this._watches.set(busName, id);
+    }
+
+    // A sender that has unregistered its last window needs no watching.
+    _unwatchSenderIfUnused(busName) {
+        for (const entry of this._menus.values()) {
+            if (entry.busName === busName)
+                return;
+        }
+        const id = this._watches.get(busName);
+        if (id) {
+            Gio.bus_unwatch_name(id);
+            this._watches.delete(busName);
+        }
     }
 
     destroy() {
