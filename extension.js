@@ -18,14 +18,12 @@ export default class GlobalMenuExtension extends Extension {
         this._logoButton = null;
         this._overviewHidden = false;
         this._activitiesMoved = false;
-        this._locked = false;
     }
 
     enable() {
         console.log(`[globalmenu@skye-xd.github.io] Enabling extension.`);
 
         this._settings = this.getSettings();
-        this._locked = null;  // neither, until _syncLocked() has run once
 
         const uuid = this.metadata.uuid || 'globalmenu@skye-xd.github.io';
 
@@ -38,9 +36,6 @@ export default class GlobalMenuExtension extends Extension {
         const IGNORED_KEYS = ['clipboard-history', 'clipboard-clear-on-startup', 'debug-logging'];
 
         this._settingsChangedId = this._settings.connect('changed', (_settings, key) => {
-            // Unlocking re-syncs everything.
-            if (this._locked)
-                return;
             if (key === 'hide-overview-button' || key === 'keep-activities-left') {
                 this._syncOverviewButton();
                 this._syncLogoPosition();
@@ -62,33 +57,6 @@ export default class GlobalMenuExtension extends Extension {
             this._syncMenuVisibility();
         }, this);
 
-        // The extension stays enabled on the lock screen only so the AppMenu
-        // registrar keeps the windows X11 apps registered: an app need not
-        // register again, and loses its menu if the registrar is torn down
-        // under it. Nothing else may run while locked. This holds because the
-        // shell enables extensions listing more session modes first, so the
-        // user-only ones it disables at lock do not cycle this one -- but
-        // enable() can still be called while locked (re-enabled mid-session,
-        // it lands after them), hence the check here and not only on change.
-        Main.sessionMode.connectObject('updated', () => this._syncLocked(), this);
-        this._syncLocked();
-    }
-
-    _syncLocked() {
-        const locked = Main.sessionMode.isLocked;
-        if (locked === this._locked)
-            return;
-        this._locked = locked;
-        this._menuManager.setLocked(locked);
-        if (locked) {
-            // The panel stays up on the lock screen, and the shell hides only
-            // its own indicators there.
-            this._logoButton?.destroy();
-            this._logoButton = null;
-            return;
-        }
-        // The shell has just re-laid the panel for the unlocked session, so
-        // place everything again as enable() would.
         this._syncOverviewButton();
         this._syncLogoButton();
         this._syncMenuVisibility();
@@ -153,7 +121,7 @@ export default class GlobalMenuExtension extends Extension {
     }
 
     _syncMenuVisibility() {
-        if (!this._menuManager || this._locked) return;
+        if (!this._menuManager) return;
 
         if (this._settings.get_boolean('show-indicator')) {
             let activeWindow = global.display.get_focus_window();
@@ -167,8 +135,6 @@ export default class GlobalMenuExtension extends Extension {
         console.log(`[globalmenu@skye-xd.github.io] Disabling extension.`);
 
         global.display.disconnectObject(this);
-        Main.sessionMode.disconnectObject(this);
-        this._locked = false;
 
         if (this._settings && this._settingsChangedId) {
             this._settings.disconnect(this._settingsChangedId);
