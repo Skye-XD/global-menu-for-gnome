@@ -4,10 +4,11 @@
 
 // dbusmenu's "shortcut" property is a list of key combinations, each a list of
 // modifier names followed by the key: [['Control', 'Shift', 'n']]. Only the
-// first combination is shown, as GTK and macOS menus do.
+// first combination is shown, as GTK and macOS menus do. It comes straight
+// from the app as a variant, so anything but a list of strings is ignored.
 export function fromDbusmenu(shortcut) {
     const combo = Array.isArray(shortcut) ? shortcut[0] : null;
-    if (!Array.isArray(combo) || !combo.length)
+    if (!Array.isArray(combo) || !combo.length || !combo.every(k => typeof k === 'string'))
         return null;
     const key = combo[combo.length - 1];
     return combo.slice(0, -1).map(m => `<${m}>`).join('') + key;

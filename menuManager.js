@@ -62,6 +62,13 @@ const DING_BUS_NAME = 'com.desktop.ding';
 const DING_CLICK_SIGNAL = 'desktopclick';
 const DESKTOP_CLICK_FRESH_US = 1000 * 1000;
 
+// A menu item can outlive its window: the rebuild that would drop it waits
+// until the open menu closes. Acting on an unmanaged MetaWindow is never
+// right, and mutter drops a window from its lists as it unmanages it.
+function isManaged(window) {
+    return global.display.list_all_windows().includes(window);
+}
+
 // Spawn a command safely using an argv array so no shell parsing/injection
 // can occur, and so arguments with spaces or special characters are passed
 // through intact.
@@ -510,6 +517,8 @@ export class MenuManager {
         this._context = null;
         this._fallbackIsTransient = false;
         this._desktopClickAt = 0;
+        this._locked = false;
+        this._destroyed = false;
 
         // The click is announced a moment after focus has already been handled
         // as a transient gap, so re-evaluate rather than only recording it.
@@ -546,7 +555,22 @@ export class MenuManager {
         this._emojiPicker = new EmojiPicker();
     }
 
+    // While the screen is locked the bar must show nothing and follow nothing:
+    // it is emptied, the floating panels are closed, and every path back in is
+    // ignored until unlock. The registrar keeps running, so the windows X11
+    // apps registered are still known afterwards.
+    setLocked(locked) {
+        this._locked = locked;
+        if (!locked)
+            return;
+        this._clipboardPanel?.close();
+        this._emojiPicker?.close();
+        this.clear();
+    }
+
     updateMenuForWindow(window) {
+        if (this._locked || this._destroyed)
+            return;
         let appName = this._settings.get_string('desktop-app-name') || 'Nautilus';
         let isAppFocused = false;
         let isDesktop = false;
@@ -642,11 +666,20 @@ export class MenuManager {
         // A menubar the app registered itself is the real thing -- authored,
         // ordered and labelled by the app -- so it wins over what can be
         // assembled from action groups.
-        const registered = isAppFocused ? this._registrar.menuFor(xidOf(window)) : null;
-        if (registered)
-            this._appMenu = new DbusMenuSource(registered, () => this._queueRebuild());
-        else if (source)
-            this._appMenu = new AppActionMenu(source, () => this._queueRebuild());
+        //
+        // Both read the app's own data. Whatever goes wrong, the bar is still
+        // rebuilt below, for this window: returning early would leave the
+        // previous app's menus up, every item acting on that app.
+        try {
+            const registered = isAppFocused ? this._registrar.menuFor(xidOf(window)) : null;
+            if (registered)
+                this._appMenu = new DbusMenuSource(registered, () => this._queueRebuild());
+            else if (source)
+                this._appMenu = new AppActionMenu(source, () => this._queueRebuild());
+        } catch (e) {
+            console.warn(`[globalmenu] Reading ${appName}'s menus failed: ${e}`);
+            this._appMenu = null;
+        }
 
         this._rebuild();
     }
@@ -741,6 +774,8 @@ export class MenuManager {
     // A shorter request replaces a pending longer one, so a populate poll is
     // not held back behind the coalescing debounce.
     _queueRebuild(delayMs = REBUILD_DEBOUNCE_MS) {
+        if (this._locked || this._destroyed)
+            return;
         const dueAt = GLib.get_monotonic_time() + delayMs * 1000;
         if (this._rebuildTimeoutId) {
             if (dueAt >= this._rebuildDueAt)
@@ -764,27 +799,33 @@ export class MenuManager {
     _windowOperations(window) {
         if (!window)
             return [];
+        const ifManaged = fn => () => {
+            if (isManaged(window))
+                fn();
+        };
         const items = [
-            { label: 'Minimise', enabled: window.can_minimize(), activate: () => window.minimize() },
+            { label: 'Minimise', enabled: window.can_minimize(), activate: ifManaged(() => window.minimize()) },
             {
                 label: window.is_maximized() ? 'Unmaximise' : 'Maximise',
                 enabled: window.can_maximize() || window.is_maximized(),
-                activate: () => window.is_maximized()
+                activate: ifManaged(() => window.is_maximized()
                     ? window.unmaximize()
-                    : window.maximize(),
+                    : window.maximize()),
             },
             {
                 label: window.is_fullscreen() ? 'Leave Full Screen' : 'Enter Full Screen',
                 enabled: true,
-                activate: () => window.is_fullscreen() ? window.unmake_fullscreen() : window.make_fullscreen(),
+                activate: ifManaged(() => window.is_fullscreen() ? window.unmake_fullscreen() : window.make_fullscreen()),
             },
         ];
         if (window.can_close())
-            items.push({ type: 'separator' }, { label: 'Close Window', enabled: true, activate: () => window.delete(global.get_current_time()) });
+            items.push({ type: 'separator' }, { label: 'Close Window', enabled: true, activate: ifManaged(() => window.delete(global.get_current_time())) });
         return items;
     }
 
     _rebuild() {
+        if (this._locked || this._destroyed)
+            return;
         const { appName, detectedApp, window } = this._context || {};
 
         // A D-Bus action group is empty the moment it is created and fills in
@@ -807,7 +848,14 @@ export class MenuManager {
             return;
         }
 
-        let menus = this._appMenu ? this._appMenu.getMenus() : [];
+        // As in updateMenuForWindow: a source that throws leaves this window
+        // with the menus built below, never the previous app's.
+        let menus = [];
+        try {
+            menus = this._appMenu ? this._appMenu.getMenus() : [];
+        } catch (e) {
+            console.warn(`[globalmenu] Building ${appName}'s menus failed: ${e}`);
+        }
 
         // Chrome publishes no bus name at all and Firefox publishes one with no
         // action group behind it, so neither contributes a menu -- and without
@@ -844,7 +892,10 @@ export class MenuManager {
                     windows.forEach(win => children.push({
                         label: win.get_title() || appName,
                         enabled: true,
-                        activate: () => win.activate(global.get_current_time()),
+                        activate: () => {
+                            if (isManaged(win))
+                                win.activate(global.get_current_time());
+                        },
                     }));
                 }
             }
@@ -979,6 +1030,7 @@ export class MenuManager {
     }
 
     destroy() {
+        this._destroyed = true;
         this._registrar?.destroy();
         this._registrar = null;
         if (this._dingClickId) {
