@@ -174,7 +174,7 @@ export class ClipboardPanel {
         // defines, instead of a hardcoded look.
         this._actor = new St.BoxLayout({
             style_class: 'globalmenu-clipboard-panel popup-menu-content',
-            vertical: true,
+            orientation: Clutter.Orientation.VERTICAL,
             reactive: true,
             visible: false,
         });
@@ -215,7 +215,7 @@ export class ClipboardPanel {
             style_class: 'globalmenu-clipboard-scroll',
             overlay_scrollbars: true,
         });
-        this._listBox = new St.BoxLayout({ vertical: true, style_class: 'globalmenu-clipboard-list' });
+        this._listBox = new St.BoxLayout({ orientation: Clutter.Orientation.VERTICAL, style_class: 'globalmenu-clipboard-list' });
         this._scroll.set_child(this._listBox);
         this._actor.add_child(this._scroll);
 
@@ -250,7 +250,7 @@ export class ClipboardPanel {
             can_focus: true,
         });
 
-        let row = new St.BoxLayout({ vertical: false, x_expand: true });
+        let row = new St.BoxLayout({ orientation: Clutter.Orientation.HORIZONTAL, x_expand: true });
 
         let preview = entry.text.length > MAX_PREVIEW_LEN
             ? entry.text.slice(0, MAX_PREVIEW_LEN) + '…'
