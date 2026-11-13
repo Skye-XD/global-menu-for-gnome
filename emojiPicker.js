@@ -1956,7 +1956,7 @@ export class EmojiPicker {
 
         this._actor = new St.BoxLayout({
             style_class: 'globalmenu-emoji-panel popup-menu-content',
-            vertical: true,
+            orientation: Clutter.Orientation.VERTICAL,
             reactive: true,
             visible: false,
         });
@@ -2018,7 +2018,7 @@ export class EmojiPicker {
         });
         this._gridBox = new St.BoxLayout({
             style_class: 'globalmenu-emoji-grid',
-            vertical: true,
+            orientation: Clutter.Orientation.VERTICAL,
             x_expand: true,
         });
         this._scroll.set_child(this._gridBox);
